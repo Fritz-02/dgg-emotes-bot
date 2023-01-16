@@ -1,7 +1,10 @@
+from functools import cache
 import json
 import logging
+import re
 import asyncio
 from threading import Timer
+from typing import Union
 
 from dggbot import DGGBot, Message, PrivateMessage
 import requests
@@ -20,6 +23,9 @@ emotes_bot.last_message = ""
 emotes_bot.blacklist = config["blacklist"]
 emotes_bot.admins = config["admins"]
 
+vyneer_phrases = "https://vyneer.me/tools/phrases?ts=1"
+regex_check = re.compile(r"^/.*/$")
+
 
 def save_config():
     to_json = {
@@ -31,7 +37,34 @@ def save_config():
         config_json.write(json.dumps(to_json, indent=2))
 
 
-def generate_link(msg_data: str, msg_author: str):
+def is_regex(text: str) -> Union[re.Pattern, None]:
+    if regex_check.search(text):
+        try:
+            return re.compile(text[1:-1])
+        except re.error:
+            pass
+
+
+@cache
+def get_phrases():
+    r = requests.get(vyneer_phrases)
+    data = r.json()["data"]
+    regex_phrases = []
+    phrases = []
+    for item in data:
+        if (regex := is_regex(phrase := item["phrase"])) is not None:
+            regex_phrases.append(regex)
+        else:
+            phrases.append(phrase)
+    return tuple(phrases), regex_phrases
+
+
+def check_for_bad_word(text: str) -> bool:
+    phrases, regex_phrases = get_phrases()
+    return (text in phrases) or any(regex.search(text) for regex in regex_phrases)
+
+
+def generate_link(msg_author: str, requested_link: str = None):
     def user_response(user):
         response = None
         api_link = f"https://tena.dev/api/users/{user}"
@@ -58,13 +91,12 @@ def generate_link(msg_data: str, msg_author: str):
         return response
 
     response = None
-    if msg_data.count(" ") >= 1:
-        requested_link = [i for i in msg_data.split(" ") if i][1]
+    if requested_link is not None:
         if arg_is_emote := emote_response(requested_link):
             response = arg_is_emote
         elif arg_is_user := user_response(requested_link):
             response = arg_is_user
-    if not response:
+    else:
         author_in_db = user_response(msg_author)
         response = author_in_db if author_in_db else "No stats exist for your username"
     return response
@@ -89,9 +121,11 @@ def not_blacklisted(msg: Message):
 
 @emotes_bot.command(["emotes", "emote"])
 @emotes_bot.check(not_blacklisted)
-def emotes_command(msg: Message):
+def emotes_command(msg: Message, requested_link: str = None, *_):
     if is_admin(msg) or isinstance(msg, PrivateMessage) or not cooldown["emotes"]:
-        reply = generate_link(msg.data, msg.nick)
+        if check_for_bad_word(requested_link):
+            requested_link = None
+        reply = generate_link(msg.nick, requested_link)
         if not isinstance(msg, PrivateMessage):
             if emotes_bot.last_message == reply:
                 reply += " ."
@@ -138,6 +172,13 @@ def blacklist_command(msg: Message):
     save_config()
     emotes_bot.last_message = reply
     msg.reply(reply)
+
+
+@emotes_bot.command(["updatephrases", "up"])
+@emotes_bot.check(is_admin)
+def update_phrases_command(msg: Message):
+    """Clears the cache for get_phrases() so it will fetch an updated list upon the next call."""
+    get_phrases.cache_clear()
 
 
 @emotes_bot.command(["admin"])
